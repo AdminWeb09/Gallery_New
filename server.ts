@@ -7,11 +7,38 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
+import { createClient } from '@supabase/supabase-js';
 
 const app = express();
 const PORT = 3000;
 const DB_FILE = path.join(process.cwd(), 'database.json');
 const UPLOADS_DIR = path.join(process.cwd(), 'public', 'uploads');
+
+// Lazy loading Supabase Client SDK helper
+let supabaseClient: any = null;
+
+function getSupabase() {
+  if (!supabaseClient) {
+    const supabaseUrl = process.env.SUPABASE_URL;
+    const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+    // Check if variables are populated and not default templates
+    if (
+      supabaseUrl &&
+      supabaseAnonKey &&
+      supabaseUrl !== 'https://your-project-id.supabase.co' &&
+      !supabaseUrl.includes('your-project-id')
+    ) {
+      try {
+        supabaseClient = createClient(supabaseUrl, supabaseAnonKey);
+        console.log('Supabase Web Gallery Client initialized successfully.');
+      } catch (err) {
+        console.error('Failed to initialize Supabase client:', err);
+      }
+    }
+  }
+  return supabaseClient;
+}
+
 
 // Ensure directories exist
 if (!fs.existsSync(path.dirname(DB_FILE))) {
@@ -176,6 +203,76 @@ function writeDB(data: GalleryItem[]): void {
   }
 }
 
+// Supabase storage bucket file uploader helper
+async function uploadToSupabaseStorage(filename: string, buffer: Buffer, ext: string): Promise<string | null> {
+  const sb = getSupabase();
+  if (!sb) return null;
+  try {
+    const contentType = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : `image/${ext}`;
+    const { data, error } = await sb.storage
+      .from('gallery_images')
+      .upload(filename, buffer, {
+        contentType,
+        cacheControl: '3600',
+        upsert: true
+      });
+    
+    if (error) {
+      console.warn('Storage upload warning (bucket gallery_images might not exist or be public):', error.message);
+      return null;
+    }
+
+    const { data: { publicUrl } } = sb.storage
+      .from('gallery_images')
+      .getPublicUrl(filename);
+    
+    return publicUrl;
+  } catch (err) {
+    console.error('Failed to upload image into Supabase Storage:', err);
+  }
+  return null;
+}
+
+// Fetch images from Supabase
+async function fetchSupabaseImages(): Promise<GalleryItem[] | null> {
+  const sb = getSupabase();
+  if (!sb) return null;
+  try {
+    const { data, error } = await sb
+      .from('gallery_items')
+      .select('*');
+    
+    if (error) {
+      console.warn('Supabase select query error/warning: ', error.message);
+      return null;
+    }
+
+    if (data) {
+      return data.map((d: any) => ({
+        id: String(d.id),
+        title: String(d.title || d.id),
+        description: String(d.description || ''),
+        imageUrl: String(d.imageUrl || d.image_url || ''),
+        category: String(d.category || 'General'),
+        tags: Array.isArray(d.tags) ? d.tags : (d.tags ? String(d.tags).split(',').map((t: string) => t.trim()).filter(Boolean) : []),
+        uploadedAt: String(d.uploadedAt || d.uploaded_at || new Date().toISOString()),
+        aspectRatio: String(d.aspectRatio || d.aspect_ratio || 'standard'),
+        isFeatured: Boolean(d.isFeatured || d.is_featured),
+        views: Number(d.views || 0),
+        likes: Number(d.likes || 0),
+        cameraModel: d.cameraModel || d.camera_model || undefined,
+        aperture: d.aperture || undefined,
+        shutterSpeed: d.shutterSpeed || d.shutter_speed || undefined,
+        iso: d.iso || undefined,
+      }));
+    }
+  } catch (err) {
+    console.error('Failed to fetch from Supabase:', err);
+  }
+  return null;
+}
+
+
 // Real-time clients list (SSE)
 let sseClients: any[] = [];
 
@@ -224,16 +321,59 @@ app.get('/api/live', (req, res) => {
   });
 });
 
+// GET Supabase connectivity status
+app.get('/api/supabase-status', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) {
+    return res.json({
+      configured: false,
+      status: 'unconfigured',
+      message: 'Supabase URL and Anon Key are not yet fully specified in environment variables.'
+    });
+  }
+
+  try {
+    const { data, error } = await sb.from('gallery_items').select('id').limit(1);
+    if (error) {
+      return res.json({
+        configured: true,
+        status: 'error_table_missing',
+        message: `Connected to Supabase, but could not query 'gallery_items' table. Make sure to run the migration DDL in your SQL editor: ${error.message}`
+      });
+    }
+    return res.json({
+      configured: true,
+      status: 'connected',
+      message: 'Successfully established authenticated link and synced with Supabase Database table!'
+    });
+  } catch (err: any) {
+    return res.json({
+      configured: true,
+      status: 'error',
+      message: `Failed to authenticate with Supabase servers: ${err.message}`
+    });
+  }
+});
+
 // GET images
-app.get('/api/images', (req, res) => {
+app.get('/api/images', async (req, res) => {
+  const sbImages = await fetchSupabaseImages();
+  if (sbImages) {
+    const sorted = [...sbImages].sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+    return res.json(sorted);
+  }
   const items = readDB();
-  // Simply return sorted list (most recent first)
   const sorted = [...items].sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
   res.json(sorted);
 });
 
 // GET single image
-app.get('/api/images/:id', (req, res) => {
+app.get('/api/images/:id', async (req, res) => {
+  const sbImages = await fetchSupabaseImages();
+  if (sbImages) {
+    const found = sbImages.find(i => i.id === req.params.id);
+    if (found) return res.json(found);
+  }
   const items = readDB();
   const found = items.find(i => i.id === req.params.id);
   if (found) {
@@ -244,36 +384,127 @@ app.get('/api/images/:id', (req, res) => {
 });
 
 // POST increment views (view counter side-channel)
-app.post('/api/images/:id/view', (req, res) => {
+app.post('/api/images/:id/view', async (req, res) => {
+  const sb = getSupabase();
+  let updatedItem: GalleryItem | null = null;
+  
+  if (sb) {
+    try {
+      const { data, error } = await sb.from('gallery_items').select('views').eq('id', req.params.id).maybeSingle();
+      if (!error && data) {
+        const nextViews = (data.views || 0) + 1;
+        const { data: updateData, error: updateError } = await sb
+          .from('gallery_items')
+          .update({ views: nextViews })
+          .eq('id', req.params.id)
+          .select('*')
+          .maybeSingle();
+        
+        if (!updateError && updateData) {
+          updatedItem = {
+            id: String(updateData.id),
+            title: String(updateData.title),
+            description: String(updateData.description || ''),
+            imageUrl: String(updateData.imageUrl || updateData.image_url),
+            category: String(updateData.category),
+            tags: Array.isArray(updateData.tags) ? updateData.tags : [],
+            uploadedAt: String(updateData.uploadedAt || updateData.uploaded_at),
+            aspectRatio: String(updateData.aspectRatio || updateData.aspect_ratio),
+            isFeatured: Boolean(updateData.isFeatured || updateData.is_featured),
+            views: Number(updateData.views),
+            likes: Number(updateData.likes),
+            cameraModel: updateData.cameraModel || undefined,
+            aperture: updateData.aperture || undefined,
+            shutterSpeed: updateData.shutterSpeed || undefined,
+            iso: updateData.iso || undefined
+          };
+        }
+      }
+    } catch (err) {
+      console.warn('Silent issue registering view count in Supabase:', err);
+    }
+  }
+
   const items = readDB();
   const index = items.findIndex(i => i.id === req.params.id);
   if (index !== -1) {
     items[index].views += 1;
     writeDB(items);
-    broadcast({ type: 'update', item: items[index] });
-    res.json(items[index]);
+    const itemToEmit = updatedItem || items[index];
+    broadcast({ type: 'update', item: itemToEmit });
+    res.json(itemToEmit);
   } else {
-    res.status(404).json({ error: 'Image not found' });
+    if (updatedItem) {
+      broadcast({ type: 'update', item: updatedItem });
+      res.json(updatedItem);
+    } else {
+      res.status(404).json({ error: 'Image not found' });
+    }
   }
 });
 
 // POST toggle like (or simple like add)
-app.post('/api/images/:id/like', (req, res) => {
+app.post('/api/images/:id/like', async (req, res) => {
+  const sb = getSupabase();
+  let updatedItem: GalleryItem | null = null;
+  
+  if (sb) {
+    try {
+      const { data, error } = await sb.from('gallery_items').select('likes').eq('id', req.params.id).maybeSingle();
+      if (!error && data) {
+        const nextLikes = (data.likes || 0) + 1;
+        const { data: updateData, error: updateError } = await sb
+          .from('gallery_items')
+          .update({ likes: nextLikes })
+          .eq('id', req.params.id)
+          .select('*')
+          .maybeSingle();
+        
+        if (!updateError && updateData) {
+          updatedItem = {
+            id: String(updateData.id),
+            title: String(updateData.title),
+            description: String(updateData.description || ''),
+            imageUrl: String(updateData.imageUrl || updateData.image_url),
+            category: String(updateData.category),
+            tags: Array.isArray(updateData.tags) ? updateData.tags : [],
+            uploadedAt: String(updateData.uploadedAt || updateData.uploaded_at),
+            aspectRatio: String(updateData.aspectRatio || updateData.aspect_ratio),
+            isFeatured: Boolean(updateData.isFeatured || updateData.is_featured),
+            views: Number(updateData.views),
+            likes: Number(updateData.likes),
+            cameraModel: updateData.cameraModel || undefined,
+            aperture: updateData.aperture || undefined,
+            shutterSpeed: updateData.shutterSpeed || undefined,
+            iso: updateData.iso || undefined
+          };
+        }
+      }
+    } catch (err) {
+      console.warn('Silent issue registering like count in Supabase:', err);
+    }
+  }
+
   const items = readDB();
   const index = items.findIndex(i => i.id === req.params.id);
   if (index !== -1) {
-    // Simple toggle like or support increment
     items[index].likes += 1;
     writeDB(items);
-    broadcast({ type: 'update', item: items[index] });
-    res.json(items[index]);
+    const itemToEmit = updatedItem || items[index];
+    broadcast({ type: 'update', item: itemToEmit });
+    res.json(itemToEmit);
   } else {
-    res.status(404).json({ error: 'Image not found' });
+    if (updatedItem) {
+      broadcast({ type: 'update', item: updatedItem });
+      res.json(updatedItem);
+    } else {
+      res.status(404).json({ error: 'Image not found' });
+    }
   }
 });
 
 // POST upload new image
-app.post('/api/images', (req, res) => {
+app.post('/api/images', async (req, res) => {
   try {
     const {
       title,
@@ -303,12 +534,19 @@ app.post('/api/images', (req, res) => {
     const filename = `uploaded_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.${ext === 'jpeg' ? 'jpg' : ext}`;
     const filePath = path.join(UPLOADS_DIR, filename);
 
-    fs.writeFileSync(filePath, Buffer.from(cleanBase64, 'base64'));
+    const buffer = Buffer.from(cleanBase64, 'base64');
+    fs.writeFileSync(filePath, buffer);
 
-    // The image path exposed over API
-    const imageUrl = `/uploads/${filename}`;
+    // Initial local fallback URL
+    let imageUrl = `/uploads/${filename}`;
 
-    const items = readDB();
+    // Try storing to Supabase storage bucket
+    const supabaseUrl = await uploadToSupabaseStorage(filename, buffer, ext);
+    if (supabaseUrl) {
+      imageUrl = supabaseUrl;
+      console.log('Successfully saved to Supabase storage bucket:', imageUrl);
+    }
+
     const newItem: GalleryItem = {
       id: `img_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       title: title.trim(),
@@ -327,6 +565,38 @@ app.post('/api/images', (req, res) => {
       iso: (iso || '').trim() || undefined,
     };
 
+    // Save to supersonic Supabase table (or fail silently with warning)
+    const sb = getSupabase();
+    if (sb) {
+      try {
+        const { error } = await sb.from('gallery_items').insert({
+          id: newItem.id,
+          title: newItem.title,
+          description: newItem.description,
+          imageUrl: newItem.imageUrl,
+          category: newItem.category,
+          tags: newItem.tags,
+          uploadedAt: newItem.uploadedAt,
+          aspectRatio: newItem.aspectRatio,
+          isFeatured: newItem.isFeatured,
+          views: newItem.views,
+          likes: newItem.likes,
+          cameraModel: newItem.cameraModel,
+          aperture: newItem.aperture,
+          shutterSpeed: newItem.shutterSpeed,
+          iso: newItem.iso
+        });
+        if (error) {
+          console.warn('Could not insert row in Supabase database table gallery_items: ', error.message);
+        } else {
+          console.log('Row added in Supabase DB gallery_items.');
+        }
+      } catch (err) {
+        console.warn('Error during Supabase insert lifecycle:', err);
+      }
+    }
+
+    const items = readDB();
     items.push(newItem);
     writeDB(items);
 
@@ -340,7 +610,7 @@ app.post('/api/images', (req, res) => {
 });
 
 // PUT update image details
-app.put('/api/images/:id', (req, res) => {
+app.put('/api/images/:id', async (req, res) => {
   const items = readDB();
   const index = items.findIndex(i => i.id === req.params.id);
   if (index !== -1) {
@@ -360,6 +630,29 @@ app.put('/api/images/:id', (req, res) => {
       iso: iso !== undefined ? iso.trim() || undefined : items[index].iso,
     };
 
+    const sb = getSupabase();
+    if (sb) {
+      try {
+        const { error } = await sb.from('gallery_items').update({
+          title: updated.title,
+          description: updated.description,
+          category: updated.category,
+          tags: updated.tags,
+          aspectRatio: updated.aspectRatio,
+          isFeatured: updated.isFeatured,
+          cameraModel: updated.cameraModel,
+          aperture: updated.aperture,
+          shutterSpeed: updated.shutterSpeed,
+          iso: updated.iso
+        }).eq('id', req.params.id);
+        if (error) {
+          console.warn('Failed to update row inside Supabase gallery_items table:', error.message);
+        }
+      } catch (err) {
+        console.warn('Error handling Supabase PUT update callback:', err);
+      }
+    }
+
     items[index] = updated;
     writeDB(items);
 
@@ -367,16 +660,69 @@ app.put('/api/images/:id', (req, res) => {
 
     res.json(updated);
   } else {
+    // Check if it exists in Supabase directly
+    const sb = getSupabase();
+    if (sb) {
+      try {
+        const { title, description, category, tags, aspectRatio, isFeatured, cameraModel, aperture, shutterSpeed, iso } = req.body;
+        const { data, error } = await sb.from('gallery_items').update({
+          title, description, category, tags, aspectRatio, isFeatured, cameraModel, aperture, shutterSpeed, iso
+        }).eq('id', req.params.id).select('*').maybeSingle();
+        
+        if (!error && data) {
+          const updatedItem = {
+            id: String(data.id),
+            title: String(data.title),
+            description: String(data.description || ''),
+            imageUrl: String(data.imageUrl || data.image_url),
+            category: String(data.category),
+            tags: Array.isArray(data.tags) ? data.tags : [],
+            uploadedAt: String(data.uploadedAt || data.uploaded_at),
+            aspectRatio: String(data.aspectRatio || data.aspect_ratio),
+            isFeatured: Boolean(data.isFeatured || data.is_featured),
+            views: Number(data.views),
+            likes: Number(data.likes),
+            cameraModel: data.cameraModel || undefined,
+            aperture: data.aperture || undefined,
+            shutterSpeed: data.shutterSpeed || undefined,
+            iso: data.iso || undefined
+          };
+          broadcast({ type: 'update', item: updatedItem });
+          return res.json(updatedItem);
+        }
+      } catch (err) {
+        console.warn('Failed to fallback PUT directly on Supabase:', err);
+      }
+    }
     res.status(404).json({ error: 'Image not found' });
   }
 });
 
 // DELETE delete image
-app.delete('/api/images/:id', (req, res) => {
+app.delete('/api/images/:id', async (req, res) => {
   const items = readDB();
   const foundItem = items.find(i => i.id === req.params.id);
+
+  // Remove form Supabase
+  const sb = getSupabase();
+  if (sb) {
+    try {
+      const { error } = await sb.from('gallery_items').delete().eq('id', req.params.id);
+      if (error) console.warn('Supabase delete error: ', error.message);
+
+      if (foundItem) {
+        const matchesStorage = foundItem.imageUrl.includes('/storage/v1/object/public/gallery_images/');
+        if (matchesStorage) {
+          const filename = foundItem.imageUrl.substring(foundItem.imageUrl.lastIndexOf('/') + 1);
+          await sb.storage.from('gallery_images').remove([filename]);
+        }
+      }
+    } catch (err) {
+      console.warn('Supabase deletion coordinate failed:', err);
+    }
+  }
+
   if (foundItem) {
-    // Optional: Delete physical file if it's local
     if (foundItem.imageUrl.startsWith('/uploads/')) {
       const filename = foundItem.imageUrl.replace('/uploads/', '');
       const fullPath = path.join(UPLOADS_DIR, filename);
@@ -396,13 +742,16 @@ app.delete('/api/images/:id', (req, res) => {
 
     res.json({ success: true, id: req.params.id });
   } else {
-    res.status(404).json({ error: 'Image not found' });
+    res.json({ success: true, id: req.params.id });
   }
 });
 
 // GET summary stats
-app.get('/api/stats', (req, res) => {
-  const items = readDB();
+app.get('/api/stats', async (req, res) => {
+  let items = await fetchSupabaseImages();
+  if (!items) {
+    items = readDB();
+  }
   const totalImages = items.length;
   const totalViews = items.reduce((sum, item) => sum + (item.views || 0), 0);
   const totalLikes = items.reduce((sum, item) => sum + (item.likes || 0), 0);
@@ -425,6 +774,7 @@ app.get('/api/stats', (req, res) => {
     categories
   });
 });
+
 
 // Full-stack Vite server pipeline
 async function startServer() {

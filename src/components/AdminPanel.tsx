@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { Upload, X, Trash2, Edit3, CheckCircle, Flame, Plus, Sparkles, HelpCircle } from 'lucide-react';
+import { Upload, X, Trash2, Edit3, CheckCircle, Flame, Plus, Sparkles, HelpCircle, Database } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { GalleryItem, AspectRatio } from '../types';
 import { optimizeImage, detectAspectRatio } from '../utils/imageOptimizer';
@@ -48,6 +48,21 @@ export default function AdminPanel({
   // Status hooks
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  // Supabase Status check
+  const [supabaseStatus, setSupabaseStatus] = useState<{
+    configured: boolean;
+    status: 'unconfigured' | 'connected' | 'error_table_missing' | 'error';
+    message: string;
+  } | null>(null);
+  const [showDdl, setShowDdl] = useState(false);
+
+  useEffect(() => {
+    fetch('/api/supabase-status')
+      .then(res => res.json())
+      .then(data => setSupabaseStatus(data))
+      .catch(err => console.error('Error fetching Supabase integration status:', err));
+  }, [items]);
 
   // Populate form if editing
   useEffect(() => {
@@ -229,6 +244,88 @@ export default function AdminPanel({
           </button>
         )}
       </div>
+
+      {supabaseStatus && (
+        <div className="mb-6 p-4 rounded-xl border border-neutral-800 bg-neutral-950/40 font-mono text-xs flex flex-col gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-neutral-300">
+              <Database className={`h-4 w-4 ${supabaseStatus.status === 'connected' ? 'text-emerald-400 animate-pulse' : 'text-neutral-500'}`} />
+              <span className="font-semibold text-white">SUPABASE LINK:</span>
+              {supabaseStatus.status === 'connected' && (
+                <span className="bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[10px] px-2.5 py-0.5 rounded-full font-bold">
+                  ACTIVE SYNC
+                </span>
+              )}
+              {supabaseStatus.status === 'unconfigured' && (
+                <span className="bg-amber-500/10 border border-amber-500/20 text-amber-400 text-[10px] px-2.5 py-0.5 rounded-full font-bold animate-pulse">
+                  OFFLINE BACKUP (LOCAL JSON)
+                </span>
+              )}
+              {supabaseStatus.status === 'error_table_missing' && (
+                <span className="bg-amber-500/10 border border-amber-500/20 text-amber-400 text-[10px] px-2.5 py-0.5 rounded-full font-bold">
+                  MIGRATION REQUIRED
+                </span>
+              )}
+              {supabaseStatus.status === 'error' && (
+                <span className="bg-red-500/10 border border-red-500/20 text-red-500 text-[10px] px-2.5 py-0.5 rounded-full font-bold">
+                  AUTH FAILURE
+                </span>
+              )}
+            </div>
+            
+            {(supabaseStatus.status === 'error_table_missing' || supabaseStatus.status === 'unconfigured') && (
+              <button
+                onClick={() => setShowDdl(!showDdl)}
+                className="text-[10px] font-bold text-amber-500 hover:text-amber-400 border border-amber-500/20 px-2.5 py-1 rounded bg-amber-500/5 hover:bg-amber-500/10 transition-colors"
+                type="button"
+              >
+                {showDdl ? 'Hide Setup DDL SQL' : 'Show Setup DDL SQL'}
+              </button>
+            )}
+          </div>
+          
+          <p className="text-[11px] text-neutral-400 leading-relaxed">
+            {supabaseStatus.message}
+            {supabaseStatus.status === 'unconfigured' && (
+              <> Add your <code className="text-white">SUPABASE_URL</code> and <code className="text-white">SUPABASE_ANON_KEY</code> to the <strong>Secrets/Environment Variables panel</strong> (Settings icon in AI Studio) to shift storage and metadata query streams to a persistent cloud environment.</>
+            )}
+          </p>
+
+          {showDdl && (
+            <div className="mt-2 bg-neutral-950 p-3.5 rounded-lg border border-neutral-850 overflow-x-auto text-[10px] text-neutral-400 select-all font-mono leading-relaxed relative">
+              <span className="absolute top-2 right-2 text-[9px] bg-neutral-800 text-neutral-400 px-1.5 py-0.5 rounded font-mono">Doble click to select all</span>
+              {`-- 1. Create your gallery_items table in your Supabase SQL Editor:
+CREATE TABLE gallery_items (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT,
+  "imageUrl" TEXT NOT NULL,
+  category TEXT DEFAULT 'General',
+  tags TEXT[] DEFAULT '{}',
+  "uploadedAt" TIMESTAMPTZ DEFAULT NOW(),
+  "aspectRatio" TEXT DEFAULT 'standard',
+  "isFeatured" BOOLEAN DEFAULT false,
+  views INT DEFAULT 0,
+  likes INT DEFAULT 0,
+  "cameraModel" TEXT,
+  aperture TEXT,
+  "shutterSpeed" TEXT,
+  iso TEXT
+);
+
+-- 2. Configure public Access Control policies 
+ALTER TABLE gallery_items ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Public Read Access" ON gallery_items FOR SELECT USING (true);
+CREATE POLICY "Public Insert Access" ON gallery_items FOR INSERT WITH CHECK (true);
+CREATE POLICY "Public Update Access" ON gallery_items FOR UPDATE USING (true);
+CREATE POLICY "Public Delete Access" ON gallery_items FOR DELETE USING (true);
+
+-- 3. Create a public storage bucket named "gallery_images" under Storage
+-- and add storage policy to allow public select and upload actions.`}
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
         
