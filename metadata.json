@@ -1,0 +1,6 @@
+{
+  "name": "Cloud Web Gallery",
+  "description": "A high-performance responsive web gallery with an admin manager, real-time image updates, search, filters, and local image compression constraints.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
